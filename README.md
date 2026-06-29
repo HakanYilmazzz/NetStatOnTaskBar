@@ -2,8 +2,6 @@
 
 A lightweight, fully transparent Windows taskbar overlay that displays real-time network download and upload speeds — directly on the taskbar, without occupying any space.
 
-![Screenshot](ss.png)
-
 ---
 
 ## ✨ Features

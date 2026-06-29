@@ -1,0 +1,22 @@
+# Python Önbellek (Cache) Dosyaları
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Sanal Ortamlar (Virtual Environments)
+venv/
+.venv/
+env/
+.env
+
+# İşletim Sistemi ve IDE Dosyaları
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Derleme, Dağıtım ve Paketleme Çıktıları (Varsa PyInstaller vb. için)
+build/
+dist/
+*.spec
+*.egg-info/

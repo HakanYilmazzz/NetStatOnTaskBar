@@ -470,8 +470,137 @@ class ConnectionMonitor(QObject):
 
 
 # ============================================================
-#  MİNİ GRAFİK (SPARKLINE) WIDGET'I
+#  İNTERNET HIZ TESTİ
 # ============================================================
+
+SPEEDTEST_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+
+SPEEDTEST_DOWN_BYTES = 15_000_000   # ~15 MB hedef (sunucu daha küçük dosya sunuyorsa o kadar indirilir)
+SPEEDTEST_UP_BYTES = 4_000_000      # ~4 MB
+
+SPEEDTEST_DOWNLOAD_CANDIDATES = [
+    {"url": "https://speedtest.tele2.net/10MB.zip", "headers": {}},
+    {"url": "https://speed.hetzner.de/100MB.bin",
+     "headers": {"Range": f"bytes=0-{SPEEDTEST_DOWN_BYTES - 1}"}},
+    {"url": f"https://speed.cloudflare.com/__down?bytes={SPEEDTEST_DOWN_BYTES}",
+     "headers": {"Referer": "https://speed.cloudflare.com/", "Origin": "https://speed.cloudflare.com"}},
+]
+
+SPEEDTEST_UPLOAD_CANDIDATES = [
+    {"url": "https://speedtest.tele2.net/upload.php", "headers": {}},
+    {"url": "https://speed.cloudflare.com/__up",
+     "headers": {"Referer": "https://speed.cloudflare.com/", "Origin": "https://speed.cloudflare.com"}},
+]
+
+SPEEDTEST_PING_HOST = "1.1.1.1"
+SPEEDTEST_PING_PORT = 443
+SPEEDTEST_PING_SAMPLES = 5
+
+
+class SpeedTestWorker(QObject):
+    progress_signal = pyqtSignal(str)
+    result_signal = pyqtSignal(dict)
+    error_signal = pyqtSignal(str)
+
+    def start(self):
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _ping_test(self):
+        samples = []
+        for _ in range(SPEEDTEST_PING_SAMPLES):
+            try:
+                start = time.perf_counter()
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(2.0)
+                s.connect((SPEEDTEST_PING_HOST, SPEEDTEST_PING_PORT))
+                s.close()
+                samples.append((time.perf_counter() - start) * 1000.0)
+            except Exception:
+                pass
+            time.sleep(0.15)
+        if not samples:
+            return None, None
+        avg = sum(samples) / len(samples)
+        jitter = (max(samples) - min(samples)) if len(samples) > 1 else 0.0
+        return avg, jitter
+
+    def _download_test(self):
+        errors = []
+        for candidate in SPEEDTEST_DOWNLOAD_CANDIDATES:
+            headers = {'User-Agent': SPEEDTEST_UA}
+            headers.update(candidate["headers"])
+            req = urllib.request.Request(candidate["url"], headers=headers)
+            total_read = 0
+            start = time.perf_counter()
+            try:
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    while True:
+                        chunk = resp.read(262144)
+                        if not chunk:
+                            break
+                        total_read += len(chunk)
+                        elapsed_so_far = time.perf_counter() - start
+                        mb = total_read / (1024 * 1024)
+                        self.progress_signal.emit(f"İndirme test ediliyor... {mb:.1f} MB")
+                        if elapsed_so_far > 12 or total_read >= SPEEDTEST_DOWN_BYTES:
+                            break
+            except Exception as e:
+                errors.append(f"{candidate['url']} -> {e}")
+                continue
+            elapsed = time.perf_counter() - start
+            if elapsed <= 0 or total_read == 0:
+                errors.append(f"{candidate['url']} -> veri alınamadı")
+                continue
+            mbps = (total_read * 8) / (elapsed * 1_000_000)
+            return mbps, None
+        return None, " | ".join(errors) if errors else "Bilinmeyen hata"
+
+    def _upload_test(self):
+        payload = os.urandom(SPEEDTEST_UP_BYTES)
+        errors = []
+        for candidate in SPEEDTEST_UPLOAD_CANDIDATES:
+            headers = {'User-Agent': SPEEDTEST_UA, 'Content-Type': 'application/octet-stream'}
+            headers.update(candidate["headers"])
+            req = urllib.request.Request(candidate["url"], data=payload, method='POST', headers=headers)
+            start = time.perf_counter()
+            try:
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    resp.read(4096)
+            except Exception as e:
+                errors.append(f"{candidate['url']} -> {e}")
+                continue
+            elapsed = time.perf_counter() - start
+            if elapsed <= 0:
+                errors.append(f"{candidate['url']} -> süre ölçülemedi")
+                continue
+            mbps = (len(payload) * 8) / (elapsed * 1_000_000)
+            return mbps, None
+        return None, " | ".join(errors) if errors else "Bilinmeyen hata"
+
+    def _run(self):
+        self.progress_signal.emit("Gecikme ölçülüyor...")
+        ping_ms, jitter_ms = self._ping_test()
+
+        self.progress_signal.emit("İndirme test ediliyor...")
+        down_mbps, down_err = self._download_test()
+        if down_mbps is None:
+            self.error_signal.emit(f"İndirme testi başarısız: {down_err}")
+            return
+
+        self.progress_signal.emit("Yükleme test ediliyor...")
+        up_mbps, up_err = self._upload_test()
+        if up_mbps is None:
+            self.error_signal.emit(f"Yükleme testi başarısız: {up_err}")
+            return
+
+        self.result_signal.emit({
+            "ping": ping_ms,
+            "jitter": jitter_ms,
+            "download_mbps": down_mbps,
+            "upload_mbps": up_mbps,
+        })
+
 
 class SparklineWidget(QWidget):
     def __init__(self, get_values_fn, color, parent=None):
@@ -969,6 +1098,180 @@ class SettingsWindow(QWidget):
 
 
 # ============================================================
+#  HIZ TESTİ PENCERESİ
+# ============================================================
+
+class SpeedTestWindow(QWidget):
+    def __init__(self, controller, parent=None):
+        super().__init__(parent)
+        self.controller = controller
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint |
+            Qt.WindowType.WindowStaysOnTopHint |
+            Qt.WindowType.Popup
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setFixedSize(320, 340)
+        self.worker = None
+        self.init_ui()
+        self.position_above_tray()
+
+    def accent(self):
+        return get_theme(CONFIG.get("theme", DEFAULT_THEME))["accent"]
+
+    def init_ui(self):
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+        self.container = QFrame(self)
+        self.container.setStyleSheet(f"""
+            QFrame {{
+                background-color: rgba(30, 30, 30, 245);
+                border: 1px solid rgba(255, 255, 255, 30);
+                border-radius: 12px;
+            }}
+            QLabel {{
+                color: white;
+                font-family: 'Segoe UI', 'Consolas', sans-serif;
+                font-size: 12px;
+                background: transparent;
+                border: none;
+            }}
+            QPushButton {{
+                background-color: rgba(255, 255, 255, 20);
+                border: 1px solid rgba(255, 255, 255, 40);
+                border-radius: 6px;
+                color: white;
+                font-size: 12px;
+                padding: 7px 10px;
+            }}
+            QPushButton:hover {{
+                background-color: rgba(255, 255, 255, 40);
+            }}
+            QPushButton:disabled {{
+                color: rgba(255, 255, 255, 90);
+            }}
+        """)
+        layout = QVBoxLayout(self.container)
+        layout.setContentsMargins(15, 15, 15, 15)
+        layout.setSpacing(10)
+
+        title = QLabel("<b>🚀 İnternet Hız Testi</b>", self.container)
+        title.setStyleSheet(f"font-size: 15px; color: {self.accent()};")
+        layout.addWidget(title)
+
+        self.status_label = QLabel("Başlatmak için butona basın.", self.container)
+        self.status_label.setStyleSheet("color: #CCCCCC; font-size: 12px; margin-top: 4px;")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        results_frame = QFrame(self.container)
+        results_frame.setStyleSheet("background: transparent; border: none;")
+        results_layout = QVBoxLayout(results_frame)
+        results_layout.setContentsMargins(0, 8, 0, 8)
+        results_layout.setSpacing(6)
+
+        def make_result_row(icon_label_text):
+            row = QHBoxLayout()
+            lbl = QLabel(icon_label_text, results_frame)
+            lbl.setStyleSheet("color: #AAAAAA; font-size: 13px;")
+            val = QLabel("—", results_frame)
+            val.setStyleSheet("color: white; font-size: 16px; font-weight: bold;")
+            row.addWidget(lbl)
+            row.addStretch(1)
+            row.addWidget(val)
+            results_layout.addLayout(row)
+            return val
+
+        self.ping_value = make_result_row("⏱ Gecikme")
+        self.jitter_value = make_result_row("📶 Jitter")
+        self.down_value = make_result_row("⬇ İndirme")
+        self.up_value = make_result_row("⬆ Yükleme")
+
+        layout.addWidget(results_frame)
+        layout.addStretch(1)
+
+        self.start_btn = QPushButton("Testi Başlat", self.container)
+        self.start_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.start_btn.clicked.connect(self.start_test)
+        layout.addWidget(self.start_btn)
+
+        close_btn = QPushButton("Kapat", self.container)
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.clicked.connect(self.close)
+        layout.addWidget(close_btn)
+
+        main_layout.addWidget(self.container)
+
+    def start_test(self):
+        self.start_btn.setEnabled(False)
+        self.start_btn.setText("Test sürüyor...")
+        self.ping_value.setText("—")
+        self.jitter_value.setText("—")
+        self.down_value.setText("—")
+        self.up_value.setText("—")
+        self.status_label.setText("Hazırlanıyor...")
+
+        self.worker = SpeedTestWorker()
+        self.worker.progress_signal.connect(self.on_progress)
+        self.worker.result_signal.connect(self.on_result)
+        self.worker.error_signal.connect(self.on_error)
+        self.worker.start()
+
+    def on_progress(self, text):
+        self.status_label.setText(text)
+
+    def on_result(self, data):
+        ping_ms = data.get("ping")
+        jitter_ms = data.get("jitter")
+        down_mbps = data.get("download_mbps")
+        up_mbps = data.get("upload_mbps")
+        self.ping_value.setText(f"{ping_ms:.0f} ms" if ping_ms is not None else "—")
+        self.jitter_value.setText(f"{jitter_ms:.0f} ms" if jitter_ms is not None else "—")
+        self.down_value.setText(f"{down_mbps:.1f} Mbps" if down_mbps is not None else "—")
+        self.up_value.setText(f"{up_mbps:.1f} Mbps" if up_mbps is not None else "—")
+        self.status_label.setText("Test tamamlandı ✅")
+        self.start_btn.setEnabled(True)
+        self.start_btn.setText("Tekrar Test Et")
+
+    def on_error(self, message):
+        self.status_label.setText(f"Hata: {message}")
+        self.start_btn.setEnabled(True)
+        self.start_btn.setText("Tekrar Dene")
+
+    def position_above_tray(self):
+        screen = QApplication.primaryScreen()
+        dpr = screen.devicePixelRatio()
+        avail = screen.availableGeometry()
+        widget_width = self.width()
+        widget_height = self.height()
+        x = avail.width() - widget_width - 20
+        y = avail.height() - widget_height - 10
+        try:
+            tray_wnd = user32.FindWindowW("Shell_TrayWnd", None)
+            if tray_wnd:
+                notify_wnd = user32.FindWindowExW(tray_wnd, 0, "TrayNotifyWnd", None)
+                if notify_wnd:
+                    rect = RECT()
+                    if user32.GetWindowRect(notify_wnd, ctypes.byref(rect)):
+                        tray_top = int(rect.top / dpr)
+                        tray_right = int(rect.right / dpr)
+                        calc_x = tray_right - widget_width - 10
+                        calc_y = tray_top - widget_height - 5
+                        if calc_x >= 0 and calc_y >= 0:
+                            x, y = calc_x, calc_y
+        except Exception:
+            pass
+        self.move(x, y)
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.ActivationChange:
+            if not self.isActiveWindow():
+                if self.worker is None or self.start_btn.isEnabled():
+                    self.close()
+
+
+# ============================================================
 #  TASKBAR ÜZERİNDEKİ HIZ GÖSTERGESİ
 # ============================================================
 
@@ -988,6 +1291,8 @@ class SpeedMeterWidget(QWidget):
         self.setAutoFillBackground(False)
         self.font = QFont("Consolas", 10, QFont.Weight.Bold)
         self.font.setStyleHint(QFont.StyleHint.Monospace)
+        self.icon_font = QFont("Consolas", 8, QFont.Weight.Bold)
+        self.icon_font.setStyleHint(QFont.StyleHint.Monospace)
         self.small_font = QFont("Consolas", 8, QFont.Weight.Bold)
         self.small_font.setStyleHint(QFont.StyleHint.Monospace)
         self.setFont(self.font)
@@ -1128,11 +1433,21 @@ class SpeedMeterWidget(QWidget):
             painter.setPen(color)
             painter.drawText(x, y, text)
 
+        def draw_outlined_icon_line(x, y, full_text, color):
+            # İlk karakter (⬇/⬆) ayrı ve daha küçük bir fontla, geri kalan sayı normal fontla çizilir.
+            icon_char = full_text[0]
+            rest_text = full_text[1:]
+            painter.setFont(self.icon_font)
+            draw_outlined_text(x, y, icon_char, color)
+            icon_width = painter.fontMetrics().horizontalAdvance(icon_char)
+            painter.setFont(self.font)
+            draw_outlined_text(x + icon_width + 1, y, rest_text, color)
+
         painter.setFont(self.font)
         fm = painter.fontMetrics()
         line_height = fm.height()
-        draw_outlined_text(5, line_height, self.download_speed_text, self.theme["down"])
-        draw_outlined_text(5, line_height * 2 + 2, self.upload_speed_text, self.theme["up"])
+        draw_outlined_icon_line(5, line_height, self.download_speed_text, self.theme["down"])
+        draw_outlined_icon_line(5, line_height * 2 + 2, self.upload_speed_text, self.theme["up"])
 
         painter.setFont(self.small_font)
         fm2 = painter.fontMetrics()
@@ -1184,6 +1499,7 @@ class NetStatController(QObject):
         self.widgets = []
         self.info_window = None
         self.settings_window = None
+        self.speedtest_window = None
         self.network_worker = NetworkWorker()
         self.speed_history = deque(maxlen=60)
         self.last_ping = None
@@ -1227,6 +1543,10 @@ class NetStatController(QObject):
         self.settings_action.triggered.connect(self.open_settings)
         self.tray_menu.addAction(self.settings_action)
 
+        self.speedtest_action = QAction("🚀 Hız Testi", self.app)
+        self.speedtest_action.triggered.connect(self.open_speedtest)
+        self.tray_menu.addAction(self.speedtest_action)
+
         self.move_action = QAction("📍 Pozisyonu Ayarla", self.app)
         self.move_action.setCheckable(True)
         self.move_action.toggled.connect(self.toggle_move_mode)
@@ -1262,6 +1582,15 @@ class NetStatController(QObject):
             self.settings_window.activateWindow()
         else:
             self.settings_window.close()
+
+    def open_speedtest(self):
+        if self.speedtest_window is None or not self.speedtest_window.isVisible():
+            self.speedtest_window = SpeedTestWindow(self)
+            self.speedtest_window.show()
+            self.speedtest_window.raise_()
+            self.speedtest_window.activateWindow()
+        else:
+            self.speedtest_window.close()
 
     def toggle_move_mode(self, checked):
         self._move_active = checked
@@ -1362,6 +1691,8 @@ class NetStatController(QObject):
             self.info_window.close()
         if self.settings_window:
             self.settings_window.close()
+        if self.speedtest_window:
+            self.speedtest_window.close()
         self.tray_icon.hide()
         self.app.quit()
 

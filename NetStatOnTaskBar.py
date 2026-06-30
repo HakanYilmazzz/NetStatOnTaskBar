@@ -1191,6 +1191,7 @@ class NetStatController(QObject):
         self.connected = True
         self._save_tick = 0
         self._pre_move_offset = {"x": 0, "y": 0}
+        self._move_active = False
 
         taskbars = find_taskbar_windows()
         if not taskbars:
@@ -1206,6 +1207,10 @@ class NetStatController(QObject):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_all_widgets)
         self.timer.start(1000)
+
+        self.realign_timer = QTimer(self)
+        self.realign_timer.timeout.connect(self.realign_widgets)
+        self.realign_timer.start(2000)
 
         self.conn_monitor = ConnectionMonitor()
         self.conn_monitor.ping_updated.connect(self.on_ping_updated)
@@ -1259,6 +1264,7 @@ class NetStatController(QObject):
             self.settings_window.close()
 
     def toggle_move_mode(self, checked):
+        self._move_active = checked
         if checked:
             self._pre_move_offset = dict(self.config.get("widget_offset", {"x": 0, "y": 0}))
             for w in self.widgets:
@@ -1281,6 +1287,13 @@ class NetStatController(QObject):
                 w.align_to_taskbar()
 
     # ---------------- Tema / birim / başlangıç ----------------
+
+    def realign_widgets(self):
+        if self._move_active:
+            return
+        for w in self.widgets:
+            w.align_to_taskbar()
+            keep_window_topmost(w.winId())
 
     def apply_theme(self, key):
         self.config.set("theme", key)
@@ -1340,6 +1353,7 @@ class NetStatController(QObject):
 
     def close_all(self):
         self.timer.stop()
+        self.realign_timer.stop()
         self.conn_monitor.stop()
         self.config.save()
         for w in self.widgets:
